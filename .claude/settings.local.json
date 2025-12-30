@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(cmake:*)",
+      "Bash(cmake --build:*)",
+      "Bash(grep:*)",
+      "Bash(./streamkit.exe:*)",
+      "Bash(ffmpeg:*)"
+    ]
+  }
+}

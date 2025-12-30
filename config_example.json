@@ -1,0 +1,30 @@
+{
+    "video": {
+        "width": 1920,
+        "height": 1080,
+        "fps": 30,
+        "bitrate": 4000000,
+        "codec": "h264_nvenc"
+    },
+    "audio": {
+        "sampleRate": 48000,
+        "channels": 2,
+        "bitrate": 128000,
+        "codec": "aac"
+    },
+    "network": {
+        "port": 8080,
+        "maxConnections": 10,
+        "bufferSize": 1048576
+    },
+    "cuda": {
+        "deviceId": 0,
+        "enableHardwareDecode": true,
+        "enableHardwareEncode": true
+    },
+    "decoder": {
+        "maxRetries": 3,
+        "retryDelayMs": 100,
+        "fallbackToSoftware": true
+    }
+}
