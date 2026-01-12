@@ -1,802 +1,1102 @@
+/**
+ * @file main.cpp
+ * @brief PhoenixEngine - Modern C++20 Video Player
+ * 
+ * MVP implementation using Flow Graph architecture:
+ * FileSource -> [Queue] -> Decoder -> [Queue] -> VideoSink -> Renderer
+ */
+
 #include <iostream>
+#include <cstdlib>
 #include <memory>
-#include <string>
-#include <iomanip>
+#include <thread>
+#include <atomic>
 #include <chrono>
-#include <vector>
-#include <algorithm>
-#include <numeric>
-#include <random>
-#include "common/logger.hpp"
-#include "video/decoder_base.hpp"
-#include "video/software_decoder.hpp"
-#include "video/hardware_decoder.hpp"
-#include "video/decoder_factory.hpp"
+#include <csignal>
 
-using namespace StreamKit;
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
-// Performance test result structure
-struct SeekPerformance {
-    int frame_number;
-    double seek_time_ms;
-    bool is_keyframe;
-    bool success;
-};
+// Core
+#include "core/types.hpp"
+#include "core/result.hpp"
+#include "core/media_frame.hpp"
+#include "core/clock.hpp"
 
-// Decoder performance statistics structure
-struct DecoderPerformanceStats {
-    std::string decoder_name;
-    DecoderType decoder_type;
-    double avg_seek_time_ms;
-    double min_seek_time_ms;
-    double max_seek_time_ms;
-    double median_seek_time_ms;
-    double keyframe_avg_ms;
-    double non_keyframe_avg_ms;
-    int total_seeks;
-    int successful_seeks;
-    double success_rate;
-};
+// Graph
+#include "graph/concepts.hpp"
+#include "graph/pin.hpp"
+#include "graph/node.hpp"
+#include "graph/async_queue.hpp"
+#include "graph/pipeline.hpp"
 
-void printFrameInfo(const std::vector<FrameInfo>& frame_index, int start = 0, int count = 10) {
-    std::cout << "\n=== Frame Index (showing " << count << " frames from " << start << ") ===" << std::endl;
-    std::cout << std::setw(6) << "Frame" << " | " 
-              << std::setw(12) << "Time(s)" << " | "
-              << std::setw(8) << "PTS" << " | "
-              << std::setw(8) << "KeyFrame" << std::endl;
-    std::cout << std::string(50, '-') << std::endl;
-    
-    for (int i = start; i < std::min(start + count, static_cast<int>(frame_index.size())); ++i) {
-        const auto& frame = frame_index[i];
-        std::cout << std::setw(6) << frame.frame_number << " | "
-                  << std::setw(12) << std::fixed << std::setprecision(3) << frame.timestamp_sec << " | "
-                  << std::setw(8) << frame.pts << " | "
-                  << std::setw(8) << (frame.is_keyframe ? "YES" : "NO") << std::endl;
+// Nodes
+#include "nodes/source_node.hpp"
+#include "nodes/decode_node.hpp"
+#include "nodes/video_sink_node.hpp"
+#include "nodes/audio_decode_node.hpp"
+#include "nodes/audio_sink_node.hpp"
+
+// Render
+#include "render/renderer.hpp"
+#include "render/sdl_renderer.hpp"
+
+// FFmpeg version check
+extern "C" {
+#include <libavcodec/avcodec.h>
+}
+
+#if LIBAVCODEC_VERSION_MAJOR < 59
+    #error "FFmpeg 5.0+ required (libavcodec 59+). Please update FFmpeg."
+#endif
+
+// SDL2
+#include <SDL2/SDL.h>
+
+// Logging
+#include <spdlog/spdlog.h>
+
+namespace phoenix {
+
+// Global quit flag for signal handling
+static std::atomic<bool> g_quitRequested{false};
+
+#ifdef _WIN32
+/**
+ * @brief Windows Console Control Handler
+ * 
+ * This is called on a separate thread by Windows when Ctrl+C is pressed.
+ * More reliable than signal() on Windows.
+ */
+BOOL WINAPI consoleCtrlHandler(DWORD ctrlType) {
+    switch (ctrlType) {
+        case CTRL_C_EVENT:
+            // Note: Can't use spdlog here - may not be safe from this thread
+            std::cerr << "\n[WARN] Ctrl+C received, initiating shutdown...\n";
+            g_quitRequested.store(true);
+            return TRUE;  // We handled it
+            
+        case CTRL_BREAK_EVENT:
+            std::cerr << "\n[WARN] Ctrl+Break received, initiating shutdown...\n";
+            g_quitRequested.store(true);
+            return TRUE;
+            
+        case CTRL_CLOSE_EVENT:
+            std::cerr << "\n[WARN] Console close received, initiating shutdown...\n";
+            g_quitRequested.store(true);
+            // Give time for cleanup
+            Sleep(2000);
+            return TRUE;
+            
+        default:
+            return FALSE;
+    }
+}
+#endif
+
+/**
+ * @brief Signal handler for graceful shutdown (Unix/fallback)
+ */
+void signalHandler(int signal) {
+    if (signal == SIGINT || signal == SIGTERM) {
+        std::cerr << "\n[WARN] Signal " << signal << " received, initiating shutdown...\n";
+        g_quitRequested.store(true);
     }
 }
 
-DecoderPerformanceStats calculatePerformanceStats(const std::vector<SeekPerformance>& performances, 
-                                                  const std::string& decoder_name,
-                                                  DecoderType decoder_type) {
-    DecoderPerformanceStats stats;
-    stats.decoder_name = decoder_name;
-    stats.decoder_type = decoder_type;
-    stats.total_seeks = performances.size();
+/**
+ * @brief Install signal handlers
+ */
+void installSignalHandlers() {
+#ifdef _WIN32
+    // Windows: Use Console Control Handler (more reliable than signal())
+    if (!SetConsoleCtrlHandler(consoleCtrlHandler, TRUE)) {
+        spdlog::warn("Failed to set console control handler");
+    }
+#endif
     
-    std::vector<double> successful_times;
-    std::vector<double> keyframe_times;
-    std::vector<double> non_keyframe_times;
+    // Also set standard signal handlers as fallback
+    std::signal(SIGINT, signalHandler);
+    std::signal(SIGTERM, signalHandler);
     
-    int successful_count = 0;
-    for (const auto& perf : performances) {
-        if (perf.success) {
-            successful_count++;
-            successful_times.push_back(perf.seek_time_ms);
-            
-            if (perf.is_keyframe) {
-                keyframe_times.push_back(perf.seek_time_ms);
+#ifdef SIGBREAK
+    std::signal(SIGBREAK, signalHandler);
+#endif
+    
+    spdlog::debug("Signal handlers installed");
+}
+
+/**
+ * @brief Event callback type
+ */
+using EventCallback = std::function<void(PlayerEvent, const std::string&)>;
+
+/**
+ * @brief Player application class
+ * 
+ * Manages the video playback pipeline and event loop.
+ * Implements complete pre-roll state machine with timeout.
+ */
+class Player {
+public:
+    Player() = default;
+    ~Player() { shutdown(); }
+    
+    /**
+     * @brief Set event callback for UI notifications
+     */
+    void setEventCallback(EventCallback cb) {
+        eventCallback_ = std::move(cb);
+    }
+    
+    /**
+     * @brief Open a media file
+     */
+    Result<void> open(const std::string& filename) {
+        // Create nodes
+        source_ = std::make_unique<FileSourceNode>("FileSource");
+        videoDecoder_ = std::make_unique<FFmpegDecodeNode>("VideoDecoder");
+        videoSink_ = std::make_unique<VideoSinkNode>("VideoSink");
+        
+        // Create async queues for video
+        videoPacketQueue_ = std::make_unique<AsyncQueueNode<Packet>>("VideoPacketQueue", 50);
+        videoFrameQueue_ = std::make_unique<AsyncQueueNode<VideoFrame>>("VideoFrameQueue", 30);
+        
+        // Create renderer
+        renderer_ = createRenderer();
+        
+        // Open file
+        auto result = source_->open(filename);
+        if (!result.ok()) {
+            return result;
+        }
+        
+        // Check for video stream
+        if (!source_->hasVideoStream()) {
+            return Err(ErrorCode::NotFound, "No video stream found");
+        }
+        
+        // Initialize video decoder
+        result = videoDecoder_->init(source_->getVideoStream());
+        if (!result.ok()) {
+            return result;
+        }
+        
+        // Get video dimensions for window
+        auto* codecCtx = videoDecoder_->codecContext();
+        int width = codecCtx->width;
+        int height = codecCtx->height;
+        
+        // Initialize renderer
+        result = renderer_->init(width, height, "PhoenixEngine");
+        if (!result.ok()) {
+            return result;
+        }
+        
+        // Configure video sink
+        videoSink_->setRenderer(renderer_.get());
+        videoSink_->setClock(&clock_);
+        videoSink_->setReadyCallback([this] {
+            onVideoReady();
+        });
+        videoSink_->setEofCallback([this] {
+            onVideoEof();
+        });
+        videoSink_->setErrorCallback([this](const std::string& error) {
+            onError("Video: " + error);
+        });
+        
+        // Build video pipeline:
+        // Source -> VideoPacketQueue -> VideoDecoder -> VideoFrameQueue -> VideoSink
+        source_->videoOutput.connect(&videoPacketQueue_->input);
+        videoPacketQueue_->output.connect(&videoDecoder_->input);
+        videoDecoder_->output.connect(&videoFrameQueue_->input);
+        videoFrameQueue_->output.connect(&videoSink_->input);
+        
+        // Initialize audio if available
+        hasAudio_ = false;
+        if (source_->hasAudioStream()) {
+            result = initAudio();
+            if (result.ok()) {
+                hasAudio_ = true;
+                spdlog::info("Audio stream initialized");
             } else {
-                non_keyframe_times.push_back(perf.seek_time_ms);
+                spdlog::warn("Audio init failed, continuing without audio: {}", 
+                    result.error().what());
+            }
+        } else {
+            spdlog::info("No audio stream in file");
+        }
+        
+        isOpen_ = true;
+        spdlog::info("Opened: {} ({}x{}){}", filename, width, height,
+            hasAudio_ ? " with audio" : " (video only)");
+        
+        return Ok();
+    }
+    
+    /**
+     * @brief Initialize audio pipeline
+     */
+    Result<void> initAudio() {
+        // Create audio nodes
+        audioDecoder_ = std::make_unique<AudioDecodeNode>("AudioDecoder");
+        audioSink_ = std::make_unique<AudioSinkNode>("AudioSink");
+        
+        // Create async queues for audio (larger queue for audio)
+        audioPacketQueue_ = std::make_unique<AsyncQueueNode<Packet>>("AudioPacketQueue", 1000);
+        audioFrameQueue_ = std::make_unique<AsyncQueueNode<AudioFrame>>("AudioFrameQueue", 100);
+        
+        // Initialize audio decoder
+        auto result = audioDecoder_->init(source_->getAudioStream());
+        if (!result.ok()) {
+            return result;
+        }
+        
+        // Initialize audio sink with resampler
+        result = audioSink_->init(audioDecoder_->codecContext());
+        if (!result.ok()) {
+            return result;
+        }
+        
+        // Configure audio sink
+        audioSink_->setClock(&clock_);
+        audioSink_->setReadyCallback([this] {
+            onAudioReady();
+        });
+        audioSink_->setEofCallback([this] {
+            onAudioEof();
+        });
+        audioSink_->setErrorCallback([this](const std::string& error) {
+            onError("Audio: " + error);
+        });
+        
+        // Build audio pipeline:
+        // Source -> AudioPacketQueue -> AudioDecoder -> AudioFrameQueue -> AudioSink
+        source_->audioOutput.connect(&audioPacketQueue_->input);
+        audioPacketQueue_->output.connect(&audioDecoder_->input);
+        audioDecoder_->output.connect(&audioFrameQueue_->input);
+        audioFrameQueue_->output.connect(&audioSink_->input);
+        
+        return Ok();
+    }
+    
+    /**
+     * @brief Start playback with pre-roll
+     */
+    void play() {
+        if (!isOpen_) {
+            spdlog::error("No file open");
+            emitEvent(PlayerEvent::Error, "No file open");
+            return;
+        }
+        
+        if (isPlaying_) {
+            return;
+        }
+        
+        // Enter buffering state
+        pipelineState_ = PipelineState::Buffering;
+        bufferingState_ = hasAudio_ ? BufferingState::WaitingBoth : BufferingState::WaitingVideo;
+        bufferingStartTime_ = Clock::now();
+        emitEvent(PlayerEvent::Buffering, "Starting pre-roll...");
+        
+        // Configure clock based on audio availability
+        if (hasAudio_) {
+            clock_.setAudioSource(true);
+            spdlog::debug("Clock will be driven by audio");
+        } else {
+            clock_.useWallClock();
+            clock_.setAudioSource(false);
+            spdlog::debug("Clock in wall-clock mode (no audio)");
+        }
+        
+        // Start video nodes in reverse order (downstream first)
+        videoSink_->start();
+        videoFrameQueue_->start();
+        videoDecoder_->start();
+        videoPacketQueue_->start();
+        
+        // Start audio nodes if available
+        if (hasAudio_) {
+            audioSink_->start();
+            audioFrameQueue_->start();
+            audioDecoder_->start();
+            audioPacketQueue_->start();
+        }
+        
+        // Start source last
+        source_->start();
+        
+        // Start decode threads
+        videoDecodeThread_ = std::thread([this] {
+            videoDecodeLoop();
+        });
+        
+        if (hasAudio_) {
+            audioDecodeThread_ = std::thread([this] {
+                audioDecodeLoop();
+            });
+        }
+        
+        isPlaying_ = true;
+        spdlog::info("Playback started{}, waiting for pre-roll...", hasAudio_ ? " with audio" : "");
+    }
+    
+    /**
+     * @brief Stop playback
+     */
+    void stop() {
+        if (!isPlaying_) {
+            return;
+        }
+        
+        spdlog::info("Stopping playback...");
+        isPlaying_ = false;
+        
+        // ========== Step 1: Stop ALL Input Pins FIRST ==========
+        // This is CRITICAL to prevent deadlocks. We must wake up all 
+        // blocked producers (like Source) before trying to join them.
+        spdlog::debug("Step 1: Stopping input pins");
+        
+        // Stop Packet Queue Inputs (Unblocks Source)
+        videoPacketQueue_->input.stop();
+        if (hasAudio_ && audioPacketQueue_) {
+            audioPacketQueue_->input.stop();
+        }
+        
+        // Stop Frame Queue Inputs (Unblocks Decoder)
+        videoFrameQueue_->input.stop();
+        if (hasAudio_ && audioFrameQueue_) {
+            audioFrameQueue_->input.stop();
+        }
+        
+        // Stop Decoder Inputs (Unblocks Packet Queue)
+        videoDecoder_->input.stop();
+        if (hasAudio_ && audioDecoder_) {
+            audioDecoder_->input.stop();
+        }
+        
+        // Stop Sink Inputs (Unblocks Frame Queue)
+        videoSink_->input.stop();
+        if (hasAudio_ && audioSink_) {
+            audioSink_->input.stop();
+        }
+        
+        // ========== Step 2: Stop Source ==========
+        // Now safe to join source worker because its outputs are stopped
+        spdlog::debug("Step 2: Stopping source");
+        source_->stop();
+        
+        // ========== Step 3: Flush ALL Queues ==========
+        spdlog::debug("Step 3: Flushing queues");
+        
+        videoPacketQueue_->flush();
+        if (hasAudio_ && audioPacketQueue_) {
+            audioPacketQueue_->flush();
+        }
+        
+        videoFrameQueue_->flush();
+        if (hasAudio_ && audioFrameQueue_) {
+            audioFrameQueue_->flush();
+        }
+        
+        videoSink_->input.flush();
+        if (hasAudio_ && audioSink_) {
+            audioSink_->input.flush();
+        }
+        
+        // ========== Step 4: Wait for Decode Threads ==========
+        spdlog::debug("Step 4: Joining decode threads");
+        if (videoDecodeThread_.joinable()) {
+            spdlog::debug("Waiting for video decode thread...");
+            videoDecodeThread_.join();
+            spdlog::debug("Video decode thread joined");
+        }
+        
+        if (hasAudio_ && audioDecodeThread_.joinable()) {
+            spdlog::debug("Waiting for audio decode thread...");
+            audioDecodeThread_.join();
+            spdlog::debug("Audio decode thread joined");
+        }
+        
+        // ========== Step 5: Stop All Nodes (Join Workers) ==========
+        spdlog::debug("Step 5: Stopping nodes and joining workers");
+        
+        // Stop Queues
+        spdlog::debug("Stopping videoPacketQueue");
+        videoPacketQueue_->stop();
+        if (hasAudio_ && audioPacketQueue_) {
+            spdlog::debug("Stopping audioPacketQueue");
+            audioPacketQueue_->stop();
+        }
+        
+        spdlog::debug("Stopping videoFrameQueue");
+        videoFrameQueue_->stop();
+        if (hasAudio_ && audioFrameQueue_) {
+            spdlog::debug("Stopping audioFrameQueue");
+            audioFrameQueue_->stop();
+        }
+        
+        // Stop Decoders
+        spdlog::debug("Stopping videoDecoder");
+        videoDecoder_->stop();
+        if (hasAudio_ && audioDecoder_) {
+            spdlog::debug("Stopping audioDecoder");
+            audioDecoder_->stop();
+        }
+        
+        // Stop Sinks
+        spdlog::debug("Stopping videoSink");
+        videoSink_->stop();
+        if (hasAudio_ && audioSink_) {
+            spdlog::debug("Stopping audioSink");
+            audioSink_->stop();
+        }
+        
+        spdlog::info("Playback stopped successfully");
+    }
+    
+    /**
+     * @brief Request quit (for external triggers)
+     */
+    void requestQuit() {
+        quitRequested_ = true;
+        spdlog::info("Quit requested");
+    }
+    
+    /**
+     * @brief Check if quit was requested
+     */
+    bool isQuitRequested() const {
+        return quitRequested_ || g_quitRequested.load();
+    }
+    
+    /**
+     * @brief Shutdown and cleanup
+     */
+    void shutdown() {
+        if (!isOpen_) {
+            return;
+        }
+        
+        spdlog::info("Shutting down player...");
+        emitEvent(PlayerEvent::Stopped, "Shutting down...");
+        
+        // Stop playback first
+        stop();
+        
+        // Shutdown renderer
+        if (renderer_) {
+            spdlog::debug("Shutting down renderer");
+            renderer_->shutdown();
+        }
+        
+        // Reset video nodes in reverse order (downstream first)
+        spdlog::debug("Cleaning up video nodes");
+        videoSink_.reset();
+        videoFrameQueue_.reset();
+        videoDecoder_.reset();
+        videoPacketQueue_.reset();
+        
+        // Reset audio nodes
+        if (hasAudio_) {
+            spdlog::debug("Cleaning up audio nodes");
+            audioSink_.reset();
+            audioFrameQueue_.reset();
+            audioDecoder_.reset();
+            audioPacketQueue_.reset();
+        }
+        
+        source_.reset();
+        renderer_.reset();
+        
+        hasAudio_ = false;
+        isOpen_ = false;
+        pipelineState_ = PipelineState::Stopped;
+        bufferingState_ = BufferingState::Idle;
+        spdlog::info("Player shutdown complete");
+    }
+    
+    /**
+     * @brief Check if still playing
+     */
+    bool isPlaying() const { return isPlaying_ && !eofReached_; }
+    
+    /**
+     * @brief Check pre-roll timeout (call periodically from event loop)
+     */
+    void checkPrerollTimeout() {
+        if (bufferingState_ == BufferingState::Ready || 
+            bufferingState_ == BufferingState::Timeout ||
+            bufferingState_ == BufferingState::Idle) {
+            return;
+        }
+        
+        auto elapsed = std::chrono::duration_cast<Milliseconds>(
+            Clock::now() - bufferingStartTime_).count();
+        
+        if (elapsed > kPrerollTimeoutMs) {
+            completePreroll(true);
+        }
+    }
+    
+    /**
+     * @brief Get current pipeline state
+     */
+    PipelineState pipelineState() const { return pipelineState_; }
+    
+    /**
+     * @brief Get current buffering state
+     */
+    BufferingState bufferingState() const { return bufferingState_; }
+    
+    /**
+     * @brief Process SDL events
+     * @return true to continue, false to quit
+     */
+    bool processEvents() {
+        // Check global quit flag first
+        if (g_quitRequested.load()) {
+            spdlog::info("Global quit requested");
+            return false;
+        }
+        
+        SDL_Event event;
+        while (SDL_PollEvent(&event)) {
+            switch (event.type) {
+                case SDL_QUIT:
+                    spdlog::info("SDL quit event received");
+                    return false;
+                    
+                case SDL_KEYDOWN:
+                    switch (event.key.keysym.sym) {
+                        case SDLK_ESCAPE:
+                        case SDLK_q:
+                            spdlog::info("Quit key pressed");
+                            return false;
+                            
+                        case SDLK_SPACE:
+                            togglePause();
+                            break;
+                            
+                        case SDLK_LEFT:
+                            seekRelative(-5'000'000);  // -5 seconds
+                            break;
+                            
+                        case SDLK_RIGHT:
+                            seekRelative(5'000'000);   // +5 seconds
+                            break;
+                            
+                        default:
+                            break;
+                    }
+                    break;
+                    
+                case SDL_WINDOWEVENT:
+                    if (event.window.event == SDL_WINDOWEVENT_CLOSE) {
+                        spdlog::info("Window close event received");
+                        return false;
+                    }
+                    if (event.window.event == SDL_WINDOWEVENT_RESIZED) {
+                        renderer_->resize(event.window.data1, event.window.data2);
+                    }
+                    break;
             }
         }
+        
+        return !quitRequested_;
     }
     
-    stats.successful_seeks = successful_count;
-    stats.success_rate = successful_count > 0 ? (100.0 * successful_count / stats.total_seeks) : 0.0;
-    
-    if (!successful_times.empty()) {
-        std::sort(successful_times.begin(), successful_times.end());
-        stats.avg_seek_time_ms = std::accumulate(successful_times.begin(), successful_times.end(), 0.0) / successful_times.size();
-        stats.min_seek_time_ms = successful_times.front();
-        stats.max_seek_time_ms = successful_times.back();
-        stats.median_seek_time_ms = successful_times[successful_times.size() / 2];
-    } else {
-        stats.avg_seek_time_ms = stats.min_seek_time_ms = stats.max_seek_time_ms = stats.median_seek_time_ms = 0.0;
-    }
-    
-    stats.keyframe_avg_ms = keyframe_times.empty() ? 0.0 : 
-        (std::accumulate(keyframe_times.begin(), keyframe_times.end(), 0.0) / keyframe_times.size());
-    
-    stats.non_keyframe_avg_ms = non_keyframe_times.empty() ? 0.0 : 
-        (std::accumulate(non_keyframe_times.begin(), non_keyframe_times.end(), 0.0) / non_keyframe_times.size());
-    
-    return stats;
-}
-
-void printPerformanceStats(const DecoderPerformanceStats& stats) {
-    std::cout << "\n=== " << stats.decoder_name << " Performance Statistics ===" << std::endl;
-    std::cout << "🔍 SEEK PERFORMANCE (I/O intensive):" << std::endl;
-    std::cout << "Decoder Type: " << static_cast<int>(stats.decoder_type) << std::endl;
-    std::cout << "Total Seeks: " << stats.total_seeks << std::endl;
-    std::cout << "Successful: " << stats.successful_seeks << std::endl;
-    std::cout << "Success Rate: " << std::fixed << std::setprecision(1) << stats.success_rate << "%" << std::endl;
-    
-    if (stats.successful_seeks > 0) {
-        std::cout << std::fixed << std::setprecision(2);
-        std::cout << "Average Time: " << stats.avg_seek_time_ms << " ms" << std::endl;
-        std::cout << "Min Time: " << stats.min_seek_time_ms << " ms" << std::endl;
-        std::cout << "Max Time: " << stats.max_seek_time_ms << " ms" << std::endl;
-        std::cout << "Median: " << stats.median_seek_time_ms << " ms" << std::endl;
+    /**
+     * @brief Toggle pause state
+     */
+    void togglePause() {
+        if (!isPlaying_) return;
         
-        if (stats.keyframe_avg_ms > 0) {
-            std::cout << "Keyframe Avg: " << stats.keyframe_avg_ms << " ms" << std::endl;
-        }
-        if (stats.non_keyframe_avg_ms > 0) {
-            std::cout << "Non-keyframe Avg: " << stats.non_keyframe_avg_ms << " ms" << std::endl;
-        }
-        
-        std::cout << "💡 NOTE: Seek performance depends on file I/O and memory operations." << std::endl;
-        std::cout << "   Hardware decoders may be slower due to CPU-GPU communication overhead." << std::endl;
-    }
-    std::cout << std::string(50, '=') << std::endl;
-}
-
-std::vector<SeekPerformance> testRandomSeekPerformance(VideoDecoderBase* decoder, int test_count = 50) {
-    std::cout << "\n=== Testing Random Seek Performance (" << test_count << " seeks) ===" << std::endl;
-    
-    std::vector<SeekPerformance> performances;
-    int total_frames = decoder->getTotalFrames();
-    if (total_frames == 0) {
-        std::cout << "No frames available for testing" << std::endl;
-        return performances;
-    }
-    
-    auto frame_index = decoder->getFrameIndex();
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(0, total_frames - 1);
-    
-    std::cout << "Testing " << test_count << " random seeks on " << total_frames << " frames..." << std::endl;
-    
-    for (int i = 0; i < test_count; ++i) {
-        int frame_number = dis(gen);
-        
-        auto start_time = std::chrono::high_resolution_clock::now();
-        bool success = decoder->seekToFrame(frame_number);
-        auto end_time = std::chrono::high_resolution_clock::now();
-        
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-        double seek_time_ms = duration.count() / 1000.0;
-        
-        SeekPerformance perf;
-        perf.frame_number = frame_number;
-        perf.seek_time_ms = seek_time_ms;
-        perf.is_keyframe = (frame_number < static_cast<int>(frame_index.size())) ? 
-                          frame_index[frame_number].is_keyframe : false;
-        perf.success = success;
-        
-        performances.push_back(perf);
-        
-        if ((i + 1) % 10 == 0 || i == test_count - 1) {
-            std::cout << "Progress: " << (i + 1) << "/" << test_count 
-                      << " (" << std::fixed << std::setprecision(1) 
-                      << (100.0 * (i + 1) / test_count) << "%)" << std::endl;
-        }
-    }
-    
-    return performances;
-}
-
-std::vector<SeekPerformance> testSequentialSeekPerformance(VideoDecoderBase* decoder, int step = 100) {
-    std::cout << "\n=== Testing Sequential Seek Performance (every " << step << " frames) ===" << std::endl;
-    
-    std::vector<SeekPerformance> performances;
-    int total_frames = decoder->getTotalFrames();
-    if (total_frames == 0) {
-        std::cout << "No frames available for testing" << std::endl;
-        return performances;
-    }
-    
-    auto frame_index = decoder->getFrameIndex();
-    
-    for (int frame_number = 0; frame_number < total_frames; frame_number += step) {
-        auto start_time = std::chrono::high_resolution_clock::now();
-        bool success = decoder->seekToFrame(frame_number);
-        auto end_time = std::chrono::high_resolution_clock::now();
-        
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-        double seek_time_ms = duration.count() / 1000.0;
-        
-        SeekPerformance perf;
-        perf.frame_number = frame_number;
-        perf.seek_time_ms = seek_time_ms;
-        perf.is_keyframe = (frame_number < static_cast<int>(frame_index.size())) ? 
-                          frame_index[frame_number].is_keyframe : false;
-        perf.success = success;
-        
-        performances.push_back(perf);
-    }
-    
-    std::cout << "Sequential seek test completed: " << performances.size() << " seeks" << std::endl;
-    return performances;
-}
-
-std::vector<SeekPerformance> testBackwardSeekPerformance(VideoDecoderBase* decoder, int test_count = 50) {
-    std::cout << "\n=== Testing Backward Seek Performance (" << test_count << " seeks) ===" << std::endl;
-    
-    std::vector<SeekPerformance> performances;
-    int total_frames = decoder->getTotalFrames();
-    if (total_frames == 0) {
-        std::cout << "No frames available for testing" << std::endl;
-        return performances;
-    }
-    
-    auto frame_index = decoder->getFrameIndex();
-    
-    // Start from the end and seek backward
-    for (int i = 0; i < test_count; ++i) {
-        int frame_number = total_frames - 1 - (i * (total_frames / test_count));
-        if (frame_number < 0) frame_number = 0;
-        
-        auto start_time = std::chrono::high_resolution_clock::now();
-        bool success = decoder->seekToFrame(frame_number);
-        auto end_time = std::chrono::high_resolution_clock::now();
-        
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-        double seek_time_ms = duration.count() / 1000.0;
-        
-        SeekPerformance perf;
-        perf.frame_number = frame_number;
-        perf.seek_time_ms = seek_time_ms;
-        perf.is_keyframe = (frame_number < static_cast<int>(frame_index.size())) ? 
-                          frame_index[frame_number].is_keyframe : false;
-        perf.success = success;
-        
-        performances.push_back(perf);
-        
-        if ((i + 1) % 10 == 0 || i == test_count - 1) {
-            std::cout << "Backward seek progress: " << (i + 1) << "/" << test_count << std::endl;
-        }
-    }
-    
-    return performances;
-}
-
-std::vector<SeekPerformance> testShortDistanceSeeks(VideoDecoderBase* decoder, int test_count = 50) {
-    std::cout << "\n=== Testing Short Distance Seeks (1-10 frames) (" << test_count << " seeks) ===" << std::endl;
-    
-    std::vector<SeekPerformance> performances;
-    int total_frames = decoder->getTotalFrames();
-    if (total_frames == 0) {
-        std::cout << "No frames available for testing" << std::endl;
-        return performances;
-    }
-    
-    auto frame_index = decoder->getFrameIndex();
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> start_dis(0, total_frames - 20); // Leave room for short seeks
-    std::uniform_int_distribution<> offset_dis(1, 10); // Short distance: 1-10 frames
-    
-    int current_frame = 0;
-    for (int i = 0; i < test_count; ++i) {
-        // Choose a small offset from current position
-        int offset = offset_dis(gen);
-        int target_frame = current_frame + offset;
-        if (target_frame >= total_frames) {
-            target_frame = current_frame - offset;
-            if (target_frame < 0) target_frame = start_dis(gen);
-        }
-        
-        auto start_time = std::chrono::high_resolution_clock::now();
-        bool success = decoder->seekToFrame(target_frame);
-        auto end_time = std::chrono::high_resolution_clock::now();
-        
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-        double seek_time_ms = duration.count() / 1000.0;
-        
-        SeekPerformance perf;
-        perf.frame_number = target_frame;
-        perf.seek_time_ms = seek_time_ms;
-        perf.is_keyframe = (target_frame < static_cast<int>(frame_index.size())) ? 
-                          frame_index[target_frame].is_keyframe : false;
-        perf.success = success;
-        
-        performances.push_back(perf);
-        current_frame = target_frame;
-        
-        if ((i + 1) % 10 == 0 || i == test_count - 1) {
-            std::cout << "Short seek progress: " << (i + 1) << "/" << test_count << std::endl;
-        }
-    }
-    
-    return performances;
-}
-
-std::vector<SeekPerformance> testLongDistanceSeeks(VideoDecoderBase* decoder, int test_count = 30) {
-    std::cout << "\n=== Testing Long Distance Seeks (>100 frames) (" << test_count << " seeks) ===" << std::endl;
-    
-    std::vector<SeekPerformance> performances;
-    int total_frames = decoder->getTotalFrames();
-    if (total_frames == 0) {
-        std::cout << "No frames available for testing" << std::endl;
-        return performances;
-    }
-    
-    auto frame_index = decoder->getFrameIndex();
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    
-    for (int i = 0; i < test_count; ++i) {
-        // Choose two random frames that are far apart
-        int frame1 = std::uniform_int_distribution<>(0, total_frames / 2)(gen);
-        int frame2 = std::uniform_int_distribution<>(total_frames / 2, total_frames - 1)(gen);
-        
-        int target_frame = (i % 2 == 0) ? frame2 : frame1; // Alternate between first and second half
-        
-        auto start_time = std::chrono::high_resolution_clock::now();
-        bool success = decoder->seekToFrame(target_frame);
-        auto end_time = std::chrono::high_resolution_clock::now();
-        
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-        double seek_time_ms = duration.count() / 1000.0;
-        
-        SeekPerformance perf;
-        perf.frame_number = target_frame;
-        perf.seek_time_ms = seek_time_ms;
-        perf.is_keyframe = (target_frame < static_cast<int>(frame_index.size())) ? 
-                          frame_index[target_frame].is_keyframe : false;
-        perf.success = success;
-        
-        performances.push_back(perf);
-        
-        if ((i + 1) % 5 == 0 || i == test_count - 1) {
-            std::cout << "Long seek progress: " << (i + 1) << "/" << test_count << std::endl;
-        }
-    }
-    
-    return performances;
-}
-
-std::vector<SeekPerformance> testKeyframeSeeks(VideoDecoderBase* decoder, int test_count = 30) {
-    std::cout << "\n=== Testing Keyframe Seeks (" << test_count << " seeks) ===" << std::endl;
-    
-    std::vector<SeekPerformance> performances;
-    int total_frames = decoder->getTotalFrames();
-    if (total_frames == 0) {
-        std::cout << "No frames available for testing" << std::endl;
-        return performances;
-    }
-    
-    auto frame_index = decoder->getFrameIndex();
-    
-    // Find keyframes
-    std::vector<int> keyframes;
-    for (size_t i = 0; i < frame_index.size(); ++i) {
-        if (frame_index[i].is_keyframe) {
-            keyframes.push_back(i);
-        }
-    }
-    
-    if (keyframes.empty()) {
-        std::cout << "No keyframes found for testing" << std::endl;
-        return performances;
-    }
-    
-    std::cout << "Found " << keyframes.size() << " keyframes in video" << std::endl;
-    
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(0, keyframes.size() - 1);
-    
-    for (int i = 0; i < test_count; ++i) {
-        int keyframe_idx = dis(gen);
-        int frame_number = keyframes[keyframe_idx];
-        
-        auto start_time = std::chrono::high_resolution_clock::now();
-        bool success = decoder->seekToFrame(frame_number);
-        auto end_time = std::chrono::high_resolution_clock::now();
-        
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-        double seek_time_ms = duration.count() / 1000.0;
-        
-        SeekPerformance perf;
-        perf.frame_number = frame_number;
-        perf.seek_time_ms = seek_time_ms;
-        perf.is_keyframe = true;
-        perf.success = success;
-        
-        performances.push_back(perf);
-        
-        if ((i + 1) % 10 == 0 || i == test_count - 1) {
-            std::cout << "Keyframe seek progress: " << (i + 1) << "/" << test_count << std::endl;
-        }
-    }
-    
-    return performances;
-}
-
-std::vector<SeekPerformance> testNonKeyframeSeeks(VideoDecoderBase* decoder, int test_count = 30) {
-    std::cout << "\n=== Testing Non-Keyframe Seeks (" << test_count << " seeks) ===" << std::endl;
-    
-    std::vector<SeekPerformance> performances;
-    int total_frames = decoder->getTotalFrames();
-    if (total_frames == 0) {
-        std::cout << "No frames available for testing" << std::endl;
-        return performances;
-    }
-    
-    auto frame_index = decoder->getFrameIndex();
-    
-    // Find non-keyframes
-    std::vector<int> non_keyframes;
-    for (size_t i = 0; i < frame_index.size(); ++i) {
-        if (!frame_index[i].is_keyframe) {
-            non_keyframes.push_back(i);
-        }
-    }
-    
-    if (non_keyframes.empty()) {
-        std::cout << "No non-keyframes found for testing" << std::endl;
-        return performances;
-    }
-    
-    std::cout << "Found " << non_keyframes.size() << " non-keyframes in video" << std::endl;
-    
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(0, non_keyframes.size() - 1);
-    
-    for (int i = 0; i < test_count; ++i) {
-        int non_keyframe_idx = dis(gen);
-        int frame_number = non_keyframes[non_keyframe_idx];
-        
-        auto start_time = std::chrono::high_resolution_clock::now();
-        bool success = decoder->seekToFrame(frame_number);
-        auto end_time = std::chrono::high_resolution_clock::now();
-        
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-        double seek_time_ms = duration.count() / 1000.0;
-        
-        SeekPerformance perf;
-        perf.frame_number = frame_number;
-        perf.seek_time_ms = seek_time_ms;
-        perf.is_keyframe = false;
-        perf.success = success;
-        
-        performances.push_back(perf);
-        
-        if ((i + 1) % 10 == 0 || i == test_count - 1) {
-            std::cout << "Non-keyframe seek progress: " << (i + 1) << "/" << test_count << std::endl;
-        }
-    }
-    
-    return performances;
-}
-
-void testDecodingPerformance(VideoDecoderBase* decoder, int frame_count = 100) {
-    std::cout << "\n=== Testing Decoding Performance (" << frame_count << " frames) ===" << std::endl;
-    
-    // Reset to beginning
-    decoder->seekToFrame(0);
-    
-    auto start_time = std::chrono::high_resolution_clock::now();
-    int decoded_count = 0;
-    
-    for (int i = 0; i < frame_count; ++i) {
-        AVFrame* frame = decoder->decodeNextFrame();
-        if (frame) {
-            decoded_count++;
-            // Note: In real applications, frame should be released, but for performance testing we may need special handling
+        if (isPaused_) {
+            // Resume
+            source_->resume();
+            clock_.resume();
+            
+            // Resume audio sink (will unpause SDL audio)
+            if (hasAudio_ && audioSink_) {
+                audioSink_->setPaused(false);
+            }
+            
+            isPaused_ = false;
+            pipelineState_ = PipelineState::Playing;
+            emitEvent(PlayerEvent::Playing, "Resumed");
+            spdlog::info("Resumed");
         } else {
-            break; // End of file or decode failure
+            // Pause
+            source_->pause();
+            clock_.pause();
+            
+            // Pause audio sink (will output silence)
+            if (hasAudio_ && audioSink_) {
+                audioSink_->setPaused(true);
+            }
+            
+            isPaused_ = true;
+            pipelineState_ = PipelineState::Paused;
+            emitEvent(PlayerEvent::Paused, "");
+            spdlog::info("Paused");
         }
     }
     
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-    double total_time_ms = duration.count();
-    
-    double avg_time_per_frame = decoded_count > 0 ? (total_time_ms / decoded_count) : 0.0;
-    double decoding_fps = decoded_count > 0 ? (1000.0 * decoded_count / total_time_ms) : 0.0;
-    
-    std::cout << "📊 DECODING PERFORMANCE (CPU intensive):" << std::endl;
-    std::cout << "Frames Decoded: " << decoded_count << "/" << frame_count << std::endl;
-    std::cout << "Total Time: " << std::fixed << std::setprecision(2) << total_time_ms << " ms" << std::endl;
-    std::cout << "Avg Per Frame: " << std::fixed << std::setprecision(2) << avg_time_per_frame << " ms" << std::endl;
-    std::cout << "Decoding FPS: " << std::fixed << std::setprecision(2) << decoding_fps << std::endl;
-    std::cout << "🎯 " << (decoder->getStats().is_hardware_accelerated ? "Hardware" : "Software") 
-              << " decoder is " << std::fixed << std::setprecision(1) << decoding_fps << "x realtime (at 30fps)" << std::endl;
-}
-
-void printDecoderInfo(VideoDecoderBase* decoder) {
-    if (!decoder || !decoder->isInitialized()) {
-        std::cout << "Decoder not initialized" << std::endl;
-        return;
+    /**
+     * @brief Seek relative to current position
+     */
+    void seekRelative(Duration offsetUs) {
+        if (!isPlaying_) return;
+        
+        Timestamp current = clock_.now();
+        Timestamp target = current + offsetUs;
+        if (target < 0) target = 0;
+        
+        seek(target);
     }
     
-    std::cout << "\n=== Decoder Information ===" << std::endl;
-    std::cout << "Decoder Name: " << decoder->getDecoderName() << std::endl;
-    std::cout << "Decoder Type: " << static_cast<int>(decoder->getDecoderType()) << std::endl;
-    
-    if (decoder->hasVideoStream()) {
-        std::cout << "Video Size: " << decoder->getVideoWidth() << "x" << decoder->getVideoHeight() << std::endl;
-        std::cout << "Frame Rate: " << decoder->getVideoFPS() << " fps" << std::endl;
-        std::cout << "Duration: " << std::fixed << std::setprecision(2) << decoder->getDuration() << " seconds" << std::endl;
-        std::cout << "Total Frames: " << decoder->getTotalFrames() << std::endl;
-    }
-    
-    if (decoder->hasAudioStream()) {
-        std::cout << "Audio Sample Rate: " << decoder->getAudioSampleRate() << " Hz" << std::endl;
-        std::cout << "Audio Channels: " << decoder->getAudioChannels() << std::endl;
-    }
-    
-    auto stats = decoder->getStats();
-    std::cout << "\n=== Current Statistics ===" << std::endl;
-    std::cout << "Frames Decoded: " << stats.total_frames_decoded << std::endl;
-    std::cout << "Avg Decode Time: " << std::fixed << std::setprecision(2) << stats.average_decode_time_ms << " ms" << std::endl;
-    std::cout << "Decode FPS: " << std::fixed << std::setprecision(2) << stats.fps << std::endl;
-    std::cout << "Hardware Accel: " << (stats.is_hardware_accelerated ? "Yes" : "No") << std::endl;
-    std::cout << std::string(50, '=') << std::endl;
-}
-
-void compareDecoderPerformance(const std::vector<DecoderPerformanceStats>& all_stats) {
-    std::cout << "\n" << std::string(80, '=') << std::endl;
-    std::cout << "                    Decoder Performance Comparison Report" << std::endl;
-    std::cout << std::string(80, '=') << std::endl;
-    
-    // Table header
-    std::cout << std::left;
-    std::cout << std::setw(20) << "Decoder" << " | ";
-    std::cout << std::setw(8) << "Type" << " | ";
-    std::cout << std::setw(8) << "Success%" << " | ";
-    std::cout << std::setw(10) << "Avg(ms)" << " | ";
-    std::cout << std::setw(10) << "Median" << " | ";
-    std::cout << std::setw(10) << "Keyframe" << " | ";
-    std::cout << std::setw(10) << "Non-Key" << std::endl;
-    std::cout << std::string(80, '-') << std::endl;
-    
-    // Data rows
-    for (const auto& stats : all_stats) {
-        std::cout << std::left;
-        std::cout << std::setw(20) << stats.decoder_name.substr(0, 19) << " | ";
-        std::cout << std::setw(8) << static_cast<int>(stats.decoder_type) << " | ";
-        std::cout << std::setw(7) << std::fixed << std::setprecision(1) << stats.success_rate << "% | ";
-        std::cout << std::setw(10) << std::fixed << std::setprecision(2) << stats.avg_seek_time_ms << " | ";
-        std::cout << std::setw(10) << std::fixed << std::setprecision(2) << stats.median_seek_time_ms << " | ";
-        std::cout << std::setw(10) << std::fixed << std::setprecision(2) << stats.keyframe_avg_ms << " | ";
-        std::cout << std::setw(10) << std::fixed << std::setprecision(2) << stats.non_keyframe_avg_ms << std::endl;
-    }
-    
-    std::cout << std::string(80, '=') << std::endl;
-    
-    // Find best performers
-    if (!all_stats.empty()) {
-        auto best_avg = std::min_element(all_stats.begin(), all_stats.end(),
-            [](const auto& a, const auto& b) { return a.avg_seek_time_ms < b.avg_seek_time_ms; });
+    /**
+     * @brief Seek to absolute position
+     */
+    void seek(Timestamp targetUs) {
+        if (!isPlaying_) return;
         
-        auto best_success = std::max_element(all_stats.begin(), all_stats.end(),
-            [](const auto& a, const auto& b) { return a.success_rate < b.success_rate; });
+        spdlog::info("Seeking to {} ms", targetUs / 1000);
         
-        std::cout << "\n🏆 Performance Champions:" << std::endl;
-        std::cout << "  Fastest Average: " << best_avg->decoder_name 
-                  << " (" << std::fixed << std::setprecision(2) << best_avg->avg_seek_time_ms << " ms)" << std::endl;
-        std::cout << "  Highest Success Rate: " << best_success->decoder_name 
-                  << " (" << std::fixed << std::setprecision(1) << best_success->success_rate << "%)" << std::endl;
-    }
-}
-
-void testAllDecoders(const std::string& video_path) {
-    std::cout << "\n" << std::string(80, '=') << std::endl;
-    std::cout << "                    Complete Decoder Performance Test" << std::endl;
-    std::cout << "                    File: " << video_path << std::endl;
-    std::cout << std::string(80, '=') << std::endl;
-    
-    std::vector<DecoderPerformanceStats> all_performance_stats;
-    
-    // 1. Test software decoder
-    std::cout << "\n📀 Testing Software Decoder..." << std::endl;
-    auto software_decoder = VideoDecoderFactory::createSoftwareDecoder();
-    if (software_decoder && software_decoder->initialize(video_path)) {
-        printDecoderInfo(software_decoder.get());
+        PipelineState prevState = pipelineState_;
+        pipelineState_ = PipelineState::Seeking;
+        emitEvent(PlayerEvent::Seeking, std::format("Seeking to {}ms", targetUs / 1000));
         
-        // Build frame index
-        std::cout << "Building frame index..." << std::endl;
-        auto start_time = std::chrono::high_resolution_clock::now();
-        software_decoder->buildFrameIndex();
-        auto end_time = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-        std::cout << "Frame index built successfully, time: " << duration.count() << " ms" << std::endl;
+        // Increment serial to invalidate in-flight frames
+        uint64_t newSerial = ++seekSerial_;
+        source_->setSerial(newSerial);
+        videoSink_->setSerial(newSerial);
         
-        // Show some frame info
-        auto frame_index = software_decoder->getFrameIndex();
-        printFrameInfo(frame_index, 0, 5);
-        
-        // Test decoding performance
-        testDecodingPerformance(software_decoder.get(), 50);
-        
-        // Test multiple seek scenarios
-        std::cout << "\n🔍 COMPREHENSIVE SEEK PERFORMANCE TESTS" << std::endl;
-        std::cout << std::string(50, '-') << std::endl;
-        
-        // 1. Random seek performance - more tests
-        auto random_perf = testRandomSeekPerformance(software_decoder.get(), 100);
-        auto random_stats = calculatePerformanceStats(random_perf, "Software Decoder (Random)", DecoderType::SOFTWARE);
-        printPerformanceStats(random_stats);
-        all_performance_stats.push_back(random_stats);
-        
-        // 2. Sequential seek performance - different steps
-        auto sequential_perf_50 = testSequentialSeekPerformance(software_decoder.get(), 50);
-        auto sequential_stats_50 = calculatePerformanceStats(sequential_perf_50, "Software Decoder (Seq-50)", DecoderType::SOFTWARE);
-        printPerformanceStats(sequential_stats_50);
-        
-        auto sequential_perf_200 = testSequentialSeekPerformance(software_decoder.get(), 200);
-        auto sequential_stats_200 = calculatePerformanceStats(sequential_perf_200, "Software Decoder (Seq-200)", DecoderType::SOFTWARE);
-        printPerformanceStats(sequential_stats_200);
-        
-        // 3. Backward seek performance
-        auto backward_perf = testBackwardSeekPerformance(software_decoder.get(), 50);
-        auto backward_stats = calculatePerformanceStats(backward_perf, "Software Decoder (Backward)", DecoderType::SOFTWARE);
-        printPerformanceStats(backward_stats);
-        
-        // 4. Short distance vs long distance seeks
-        auto short_seek_perf = testShortDistanceSeeks(software_decoder.get(), 50);
-        auto short_seek_stats = calculatePerformanceStats(short_seek_perf, "Software Decoder (Short Distance)", DecoderType::SOFTWARE);
-        printPerformanceStats(short_seek_stats);
-        
-        auto long_seek_perf = testLongDistanceSeeks(software_decoder.get(), 30);
-        auto long_seek_stats = calculatePerformanceStats(long_seek_perf, "Software Decoder (Long Distance)", DecoderType::SOFTWARE);
-        printPerformanceStats(long_seek_stats);
-        
-        // 5. Keyframe vs Non-keyframe comparison
-        auto keyframe_perf = testKeyframeSeeks(software_decoder.get(), 30);
-        auto keyframe_stats = calculatePerformanceStats(keyframe_perf, "Software Decoder (Keyframes)", DecoderType::SOFTWARE);
-        printPerformanceStats(keyframe_stats);
-        
-        auto non_keyframe_perf = testNonKeyframeSeeks(software_decoder.get(), 30);
-        auto non_keyframe_stats = calculatePerformanceStats(non_keyframe_perf, "Software Decoder (Non-Keyframes)", DecoderType::SOFTWARE);
-        printPerformanceStats(non_keyframe_stats);
-        
-        software_decoder->close();
-    } else {
-        std::cout << "❌ Software decoder initialization failed" << std::endl;
-    }
-    
-    // 2. Test all available hardware decoders
-    auto hw_decoders = VideoDecoderBase::getAvailableHardwareDecoders();
-    std::cout << "\n🔧 Detected Hardware Decoders:" << std::endl;
-    for (const auto& hw_info : hw_decoders) {
-        std::cout << "  " << hw_info.name << ": " 
-                  << (hw_info.available ? "✓ Available" : "✗ Not Available") 
-                  << " - " << hw_info.description << std::endl;
-    }
-    
-    // Test each available hardware decoder
-    std::vector<HardwareDecoderType> test_hw_types = {
-        HardwareDecoderType::CUDA,
-        HardwareDecoderType::D3D11VA,
-        HardwareDecoderType::DXVA2,
-        HardwareDecoderType::QSV
-    };
-    
-    for (auto hw_type : test_hw_types) {
-        // Check if this hardware type is available
-        auto it = std::find_if(hw_decoders.begin(), hw_decoders.end(),
-            [hw_type](const HardwareDecoderInfo& info) {
-                return info.type == hw_type && info.available;
-            });
-        
-        if (it == hw_decoders.end()) {
-            continue; // Skip unavailable hardware decoders
+        if (hasAudio_ && audioSink_) {
+            audioSink_->setSerial(newSerial);
         }
         
-        std::cout << "\n🚀 Testing " << it->name << " Hardware Decoder..." << std::endl;
+        // Pause source during seek
+        source_->pause();
         
-        auto hardware_decoder = VideoDecoderFactory::createHardwareDecoder(hw_type);
-        if (hardware_decoder && hardware_decoder->initialize(video_path)) {
-            printDecoderInfo(hardware_decoder.get());
-            
-            // Build frame index
-            std::cout << "Building frame index..." << std::endl;
-            auto start_time = std::chrono::high_resolution_clock::now();
-            hardware_decoder->buildFrameIndex();
-            auto end_time = std::chrono::high_resolution_clock::now();
-            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-            std::cout << "Frame index built successfully, time: " << duration.count() << " ms" << std::endl;
-            
-            // Test decoding performance
-            testDecodingPerformance(hardware_decoder.get(), 50);
-            
-            // Test comprehensive seek performance for hardware decoder
-            std::cout << "\n🔍 COMPREHENSIVE SEEK PERFORMANCE TESTS (Hardware)" << std::endl;
-            std::cout << std::string(50, '-') << std::endl;
-            
-            // Random seek performance
-            auto random_perf = testRandomSeekPerformance(hardware_decoder.get(), 100);
-            auto random_stats = calculatePerformanceStats(random_perf, it->name + " (Random)", hardwareTypeToDecoderType(hw_type));
-            printPerformanceStats(random_stats);
-            all_performance_stats.push_back(random_stats);
-            
-            // Sequential seek performance - different steps
-            auto sequential_perf_50 = testSequentialSeekPerformance(hardware_decoder.get(), 50);
-            auto sequential_stats_50 = calculatePerformanceStats(sequential_perf_50, it->name + " (Seq-50)", hardwareTypeToDecoderType(hw_type));
-            printPerformanceStats(sequential_stats_50);
-            
-            // Backward seek performance
-            auto backward_perf = testBackwardSeekPerformance(hardware_decoder.get(), 50);
-            auto backward_stats = calculatePerformanceStats(backward_perf, it->name + " (Backward)", hardwareTypeToDecoderType(hw_type));
-            printPerformanceStats(backward_stats);
-            
-            // Short distance vs long distance seeks
-            auto short_seek_perf = testShortDistanceSeeks(hardware_decoder.get(), 50);
-            auto short_seek_stats = calculatePerformanceStats(short_seek_perf, it->name + " (Short)", hardwareTypeToDecoderType(hw_type));
-            printPerformanceStats(short_seek_stats);
-            
-            auto long_seek_perf = testLongDistanceSeeks(hardware_decoder.get(), 30);
-            auto long_seek_stats = calculatePerformanceStats(long_seek_perf, it->name + " (Long)", hardwareTypeToDecoderType(hw_type));
-            printPerformanceStats(long_seek_stats);
-            
-            // Keyframe vs Non-keyframe comparison
-            auto keyframe_perf = testKeyframeSeeks(hardware_decoder.get(), 30);
-            auto keyframe_stats = calculatePerformanceStats(keyframe_perf, it->name + " (Keyframes)", hardwareTypeToDecoderType(hw_type));
-            printPerformanceStats(keyframe_stats);
-            
-            auto non_keyframe_perf = testNonKeyframeSeeks(hardware_decoder.get(), 30);
-            auto non_keyframe_stats = calculatePerformanceStats(non_keyframe_perf, it->name + " (Non-Keyframes)", hardwareTypeToDecoderType(hw_type));
-            printPerformanceStats(non_keyframe_stats);
-            
-            hardware_decoder->close();
+        // Flush video queues and decoder
+        videoPacketQueue_->flush();
+        videoFrameQueue_->flush();
+        videoDecoder_->flush();
+        
+        // Flush audio queues and decoder (includes ring buffer)
+        if (hasAudio_) {
+            if (audioPacketQueue_) audioPacketQueue_->flush();
+            if (audioFrameQueue_) audioFrameQueue_->flush();
+            if (audioDecoder_) audioDecoder_->flush();
+            if (audioSink_) audioSink_->flush();
+        }
+        
+        // Reset ready flags for re-buffering
+        videoReady_ = false;
+        audioReady_ = false;
+        bufferingState_ = hasAudio_ ? BufferingState::WaitingBoth : BufferingState::WaitingVideo;
+        bufferingStartTime_ = Clock::now();
+        
+        // Seek the source
+        auto result = source_->seekTo(targetUs);
+        if (!result.ok()) {
+            spdlog::error("Seek failed: {}", result.error().what());
+            emitEvent(PlayerEvent::Error, std::format("Seek failed: {}", result.error().what()));
+            pipelineState_ = prevState;
+            return;
+        }
+        
+        // Update clock
+        clock_.seek(targetUs);
+        
+        // Resume source
+        source_->resume();
+        
+        // Restore state (or wait for buffering to complete)
+        pipelineState_ = isPaused_ ? PipelineState::Paused : PipelineState::Buffering;
+        emitEvent(PlayerEvent::SeekComplete, "");
+    }
+    
+private:
+    /**
+     * @brief Emit event to callback
+     */
+    void emitEvent(PlayerEvent event, const std::string& message = "") {
+        spdlog::debug("Event: {} - {}", playerEventToString(event), message);
+        if (eventCallback_) {
+            eventCallback_(event, message);
+        }
+    }
+    
+    /**
+     * @brief Called when video sink receives first frame
+     */
+    void onVideoReady() {
+        spdlog::info("Video stream ready (first frame received)");
+        videoReady_ = true;
+        updateBufferingState();
+    }
+    
+    /**
+     * @brief Called when audio sink receives first frame
+     */
+    void onAudioReady() {
+        spdlog::info("Audio stream ready (first frame received)");
+        audioReady_ = true;
+        updateBufferingState();
+    }
+    
+    /**
+     * @brief Update buffering state machine
+     */
+    void updateBufferingState() {
+        if (bufferingState_ == BufferingState::Ready || 
+            bufferingState_ == BufferingState::Timeout) {
+            return;  // Already completed
+        }
+        
+        // Check what we're waiting for
+        bool videoOk = !source_->hasVideoStream() || videoReady_;
+        bool audioOk = !hasAudio_ || audioReady_;
+        
+        if (videoOk && audioOk) {
+            // All streams ready!
+            completePreroll(false);
+        } else if (videoOk && !audioOk) {
+            bufferingState_ = BufferingState::WaitingAudio;
+            spdlog::debug("Pre-roll: waiting for audio...");
+        } else if (!videoOk && audioOk) {
+            bufferingState_ = BufferingState::WaitingVideo;
+            spdlog::debug("Pre-roll: waiting for video...");
         } else {
-            std::cout << "❌ " << it->name << " hardware decoder initialization failed" << std::endl;
+            bufferingState_ = BufferingState::WaitingBoth;
         }
     }
     
-    // 3. Compare all decoder performance
-    if (!all_performance_stats.empty()) {
-        compareDecoderPerformance(all_performance_stats);
+    /**
+     * @brief Complete pre-roll and start actual playback
+     */
+    void completePreroll(bool timedOut) {
+        if (bufferingState_ == BufferingState::Ready) {
+            return;  // Already completed
+        }
+        
+        bufferingState_ = timedOut ? BufferingState::Timeout : BufferingState::Ready;
+        
+        auto elapsed = std::chrono::duration_cast<Milliseconds>(
+            Clock::now() - bufferingStartTime_).count();
+        
+        if (timedOut) {
+            spdlog::warn("Pre-roll timeout after {}ms, falling back to wall clock", elapsed);
+            clock_.useWallClock();
+            emitEvent(PlayerEvent::Warning, "Pre-roll timeout, using fallback sync");
+        } else {
+            spdlog::info("Pre-roll complete in {}ms, all streams ready", elapsed);
+        }
+        
+        // Start the clock
+        if (!clockStarted_) {
+            clock_.start();
+            clockStarted_ = true;
+        }
+        
+        pipelineState_ = PipelineState::Playing;
+        emitEvent(PlayerEvent::BufferingComplete, "");
+        emitEvent(PlayerEvent::Playing, "");
     }
+    
+    /**
+     * @brief Called when video sink receives EOF
+     */
+    void onVideoEof() {
+        spdlog::debug("Video EOF");
+        videoEofReached_ = true;
+        checkAllEof();
+    }
+    
+    /**
+     * @brief Called when audio sink receives EOF
+     */
+    void onAudioEof() {
+        spdlog::debug("Audio EOF");
+        audioEofReached_ = true;
+        checkAllEof();
+    }
+    
+    /**
+     * @brief Check if all streams reached EOF
+     */
+    void checkAllEof() {
+        bool allEof = videoEofReached_;
+        if (hasAudio_) {
+            allEof = allEof && audioEofReached_;
+        }
+        
+        if (allEof && !eofReached_) {
+            spdlog::info("End of file reached");
+            eofReached_ = true;
+            pipelineState_ = PipelineState::Stopped;
+            emitEvent(PlayerEvent::EndOfFile, "Playback complete");
+        }
+    }
+    
+    /**
+     * @brief Handle error from sinks
+     */
+    void onError(const std::string& error) {
+        consecutiveErrors_++;
+        spdlog::error("Pipeline error: {} (count: {})", error, consecutiveErrors_);
+        
+        // For now, just emit the event - the pipeline continues
+        // In a more robust implementation, we might want to:
+        // - Try to recover (re-seek, restart decoder, etc.)
+        // - Enter a degraded mode (e.g., video-only if audio fails)
+        // - Stop completely if too many errors
+        
+        emitEvent(PlayerEvent::Error, error);
+        
+        if (consecutiveErrors_ >= kMaxConsecutiveDecoderErrors) {
+            spdlog::error("Too many errors, stopping playback");
+            pipelineState_ = PipelineState::Error;
+            emitEvent(PlayerEvent::Error, "Fatal: too many consecutive errors");
+            // Note: We don't automatically stop here to allow graceful shutdown
+        }
+    }
+    
+    /**
+     * @brief Video decode loop
+     */
+    void videoDecodeLoop() {
+        spdlog::debug("Video decode loop started");
+        
+        while (isPlaying_) {
+            auto [result, packet] = videoDecoder_->input.pop(std::chrono::milliseconds(100));
+            
+            if (result == PopResult::Terminated) {
+                break;
+            }
+            
+            if (result == PopResult::Timeout) {
+                continue;
+            }
+            
+            if (!packet.has_value()) {
+                continue;
+            }
+            
+            videoDecoder_->process(std::move(*packet));
+        }
+        
+        spdlog::debug("Video decode loop ended");
+    }
+    
+    /**
+     * @brief Audio decode loop
+     */
+    void audioDecodeLoop() {
+        spdlog::debug("Audio decode loop started");
+        
+        while (isPlaying_) {
+            auto [result, packet] = audioDecoder_->input.pop(std::chrono::milliseconds(100));
+            
+            if (result == PopResult::Terminated) {
+                break;
+            }
+            
+            if (result == PopResult::Timeout) {
+                continue;
+            }
+            
+            if (!packet.has_value()) {
+                continue;
+            }
+            
+            audioDecoder_->process(std::move(*packet));
+        }
+        
+        spdlog::debug("Audio decode loop ended");
+    }
+    
+    // Source node
+    std::unique_ptr<FileSourceNode> source_;
+    
+    // Video pipeline nodes
+    std::unique_ptr<FFmpegDecodeNode> videoDecoder_;
+    std::unique_ptr<VideoSinkNode> videoSink_;
+    std::unique_ptr<AsyncQueueNode<Packet>> videoPacketQueue_;
+    std::unique_ptr<AsyncQueueNode<VideoFrame>> videoFrameQueue_;
+    
+    // Audio pipeline nodes
+    std::unique_ptr<AudioDecodeNode> audioDecoder_;
+    std::unique_ptr<AudioSinkNode> audioSink_;
+    std::unique_ptr<AsyncQueueNode<Packet>> audioPacketQueue_;
+    std::unique_ptr<AsyncQueueNode<AudioFrame>> audioFrameQueue_;
+    
+    // Renderer
+    RendererPtr renderer_;
+    
+    // Clock
+    MasterClock clock_;
+    
+    // State
+    bool isOpen_ = false;
+    bool hasAudio_ = false;
+    bool videoReady_ = false;
+    bool audioReady_ = false;
+    bool clockStarted_ = false;
+    std::atomic<bool> isPlaying_{false};
+    std::atomic<bool> isPaused_{false};
+    std::atomic<bool> eofReached_{false};
+    std::atomic<bool> videoEofReached_{false};
+    std::atomic<bool> audioEofReached_{false};
+    std::atomic<bool> quitRequested_{false};
+    std::atomic<uint64_t> seekSerial_{0};
+    
+    // Pipeline state machine
+    PipelineState pipelineState_ = PipelineState::Stopped;
+    BufferingState bufferingState_ = BufferingState::Idle;
+    TimePoint bufferingStartTime_;
+    
+    // Event callback
+    EventCallback eventCallback_;
+    
+    // Error tracking
+    int consecutiveErrors_ = 0;
+    
+    // Threads
+    std::thread videoDecodeThread_;
+    std::thread audioDecodeThread_;
+};
+
+void printVersionInfo() {
+    spdlog::info("PhoenixEngine v0.1.0");
+    spdlog::info("FFmpeg libavcodec version: {}.{}.{}", 
+        LIBAVCODEC_VERSION_MAJOR, 
+        LIBAVCODEC_VERSION_MINOR,
+        LIBAVCODEC_VERSION_MICRO);
+    
+    SDL_version sdlVersion;
+    SDL_GetVersion(&sdlVersion);
+    spdlog::info("SDL version: {}.{}.{}", 
+        sdlVersion.major, 
+        sdlVersion.minor, 
+        sdlVersion.patch);
 }
 
-void testHardwareDecoderSupport() {
-    std::cout << "\n" << std::string(60, '=') << std::endl;
-    std::cout << "                Hardware Decoder Support Detection" << std::endl;
-    std::cout << std::string(60, '=') << std::endl;
-    
-    auto hw_decoders = VideoDecoderBase::getAvailableHardwareDecoders();
-    
-    if (hw_decoders.empty()) {
-        std::cout << "❌ No hardware decoders detected" << std::endl;
-        return;
-    }
-    
-    std::cout << "Detected " << hw_decoders.size() << " hardware decoders:" << std::endl;
-    std::cout << std::string(60, '-') << std::endl;
-    
-    for (const auto& decoder : hw_decoders) {
-        std::string status = decoder.available ? "✓ Available" : "✗ Not Available";
-        std::cout << std::left;
-        std::cout << std::setw(20) << decoder.name << " | ";
-        std::cout << std::setw(12) << status << " | ";
-        std::cout << decoder.description << std::endl;
-    }
-    
-    std::cout << std::string(60, '=') << std::endl;
+void printUsage() {
+    spdlog::info("Usage: PhoenixEngine <video_file>");
+    spdlog::info("");
+    spdlog::info("Controls:");
+    spdlog::info("  Space     - Pause/Resume");
+    spdlog::info("  Left      - Seek -5 seconds");
+    spdlog::info("  Right     - Seek +5 seconds");
+    spdlog::info("  Q/ESC     - Quit");
+    spdlog::info("  Ctrl+C    - Force quit");
 }
+
+int run(int argc, char* argv[]) {
+    printVersionInfo();
+
+    if (argc < 2) {
+        printUsage();
+        return 0;
+    }
+
+    const char* videoFile = argv[1];
+    spdlog::info("Opening: {}", videoFile);
+
+    // Install signal handlers for graceful shutdown
+    installSignalHandlers();
+
+    // Initialize SDL
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER) < 0) {
+        spdlog::error("SDL initialization failed: {}", SDL_GetError());
+        return 1;
+    }
+
+    int exitCode = 0;
+    
+    // Create and run player
+    {
+        Player player;
+        
+        auto result = player.open(videoFile);
+        if (!result.ok()) {
+            spdlog::error("Failed to open file: {}", result.error().what());
+            SDL_Quit();
+            return 1;
+        }
+        
+        player.play();
+        
+        // Main event loop with timeout protection
+        auto startTime = std::chrono::steady_clock::now();
+        const auto maxRunTime = std::chrono::hours(24);  // 24 hour safety timeout
+        
+        while (player.processEvents()) {
+            // Check pre-roll timeout
+            player.checkPrerollTimeout();
+            
+            // Check if playback finished
+            if (!player.isPlaying()) {
+                spdlog::info("Playback finished");
+                break;
+            }
+            
+            // Check for quit request
+            if (player.isQuitRequested()) {
+                spdlog::info("Quit requested, exiting...");
+                break;
+            }
+            
+            // Safety timeout check (prevent infinite loop)
+            auto elapsed = std::chrono::steady_clock::now() - startTime;
+            if (elapsed > maxRunTime) {
+                spdlog::warn("Maximum runtime exceeded, forcing exit");
+                exitCode = 2;
+                break;
+            }
+            
+            SDL_Delay(10);  // Prevent busy loop
+        }
+        
+        // Graceful shutdown
+        spdlog::info("Initiating cleanup...");
+        player.shutdown();
+    }
+
+    // Cleanup SDL
+    spdlog::info("Shutting down SDL...");
+    SDL_Quit();
+    
+    if (exitCode == 0) {
+        spdlog::info("Shutdown complete. Goodbye!");
+    } else {
+        spdlog::warn("Exited with code: {}", exitCode);
+    }
+
+    return exitCode;
+}
+
+} // namespace phoenix
 
 int main(int argc, char* argv[]) {
-    // Initialize logging system
-    Logger::initialize();
-    
-    std::cout << "🎬 StreamKit Decoder Performance Test Tool" << std::endl;
-    std::cout << std::string(60, '=') << std::endl;
-    
-    // 1. Detect hardware decoder support
-    testHardwareDecoderSupport();
-    
-    // 2. If video file is provided, perform complete performance test
-    if (argc > 1) {
-        std::string video_file = argv[1];
-        std::cout << "\n🎥 Starting complete performance test..." << std::endl;
-        std::cout << "Video file: " << video_file << std::endl;
+    try {
+        // Configure logging
+        spdlog::set_level(spdlog::level::debug);
+        spdlog::set_pattern("[%H:%M:%S.%e] [%^%l%$] %v");
         
-        testAllDecoders(video_file);
-        
-    } else {
-        std::cout << "\n💡 Usage: " << argv[0] << " <video_file>" << std::endl;
-        std::cout << "Example: " << argv[0] << " test_video.mp4" << std::endl;
-        std::cout << "\nFor complete performance testing, please provide a video file." << std::endl;
+        return phoenix::run(argc, argv);
+    } catch (const std::exception& e) {
+        spdlog::critical("Unhandled exception: {}", e.what());
+        return 1;
+    } catch (...) {
+        spdlog::critical("Unknown exception");
+        return 1;
     }
-    
-    std::cout << "\n✅ Test completed!" << std::endl;
-    return 0;
-} 
+}

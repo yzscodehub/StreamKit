@@ -1,190 +1,319 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.21)
+project(PhoenixEngine VERSION 0.1.0 LANGUAGES CXX)
 
-# 设置CUDA架构 - RTX 4070 Ti使用Ada Lovelace架构 (Compute Capability 8.9)
-set(CMAKE_CUDA_ARCHITECTURES "89")
-
-project(StreamKit VERSION 1.0.0 LANGUAGES CXX CUDA)
-
-# 启用CUDA语言支持
-enable_language(CUDA)
-find_package(CUDAToolkit REQUIRED)
-
-# 设置C++标准
-set(CMAKE_CXX_STANDARD 17)
+# ============================================================================
+# C++20 Configuration
+# ============================================================================
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-# 设置CUDA标准
-set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+# Export compile commands for IDE support
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# vcpkg 会自动处理依赖
-# FFmpeg 使用 vcpkg 提供的 CMake 配置
-find_package(FFMPEG REQUIRED COMPONENTS
-    avcodec
-    avformat
-    avutil
-    swscale
-)
+# ============================================================================
+# Qt 6 Configuration (Optional Editor) - Define option only, defer setup
+# ============================================================================
+option(PHOENIX_BUILD_EDITOR "Build Qt-based Editor" OFF)
 
-# 其他库使用 CMake CONFIG（vcpkg 提供）
+# ============================================================================
+# Compiler Options
+# ============================================================================
+if(MSVC)
+    add_compile_options(
+        /W4                 # Warning level 4
+        /permissive-        # Strict conformance
+        /Zc:__cplusplus     # Correct __cplusplus macro
+        /utf-8              # UTF-8 source and execution charset
+        /MP                 # Multi-processor compilation
+    )
+    # Disable specific warnings that are too noisy
+    add_compile_options(/wd4100)  # unreferenced formal parameter
+else()
+    add_compile_options(
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Wno-unused-parameter
+    )
+endif()
+
+# ============================================================================
+# FFmpeg Version Check
+# ============================================================================
+# We require FFmpeg 5.x+ for the new send/receive API
+# libavcodec 59+ = FFmpeg 5.0+
+# libavcodec 60+ = FFmpeg 6.0+
+# libavcodec 61+ = FFmpeg 7.0+
+
+# ============================================================================
+# Dependencies
+# ============================================================================
+
+# FFmpeg via vcpkg's CMake integration
+find_package(FFMPEG REQUIRED)
+
+# SDL2
+find_package(SDL2 CONFIG REQUIRED)
+
+# spdlog for logging
 find_package(spdlog CONFIG REQUIRED)
+
+# fmt (usually comes with spdlog, but explicit is better)
 find_package(fmt CONFIG REQUIRED)
 
-# nlohmann-json 是 header-only 库
-find_package(nlohmann_json CONFIG QUIET)
-
-# 包含目录
-include_directories(
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/video
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/common
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/cuda
-    ${CUDAToolkit_INCLUDE_DIRS}
+# ============================================================================
+# Source Files
+# ============================================================================
+set(PHOENIX_CORE_SOURCES
+    src/core/types.hpp
+    src/core/result.hpp
+    src/core/media_frame.hpp
+    src/core/object_pool.hpp
+    src/core/clock.hpp
 )
 
-# 源文件 - 包含新的解码器架构
-set(SOURCES
-    "src/main.cpp"
-    "src/common/logger.cpp"
-    "src/common/error_recovery.cpp"
-    "src/video/decoder_base.cpp"
-    "src/video/software_decoder.cpp"
-    "src/video/hardware_decoder.cpp"
-    "src/video/decoder_factory.cpp"
-    "src/video/timestamp_manager.cpp"
+set(PHOENIX_GRAPH_SOURCES
+    src/graph/concepts.hpp
+    src/graph/pin.hpp
+    src/graph/node.hpp
+    src/graph/async_queue.hpp
+    src/graph/pipeline.hpp
 )
 
-# 如果有 nlohmann/json，添加 config.cpp
-if(TARGET nlohmann_json::nlohmann_json)
-    list(APPEND SOURCES "src/common/config.cpp")
-    message(STATUS "Config system enabled - nlohmann/json found")
-else()
-    message(WARNING "nlohmann-json not found - Config system will be disabled")
-    message(WARNING "Install with: vcpkg install nlohmann-json:x64-windows")
-endif()
-
-# 创建主可执行文件
-add_executable(streamkit ${SOURCES})
-
-# 创建性能摘要工具
-set(SEEK_TEST_SOURCES
-    "src/performance_summary.cpp"
-    "src/common/logger.cpp"
-    "src/common/error_recovery.cpp"
-    "src/video/decoder_base.cpp"
-    "src/video/software_decoder.cpp"
-    "src/video/hardware_decoder.cpp"
-    "src/video/decoder_factory.cpp"
-    "src/video/timestamp_manager.cpp"
+set(PHOENIX_CODEC_SOURCES
+    src/codec/ffmpeg/ff_utils.hpp
+    src/codec/ffmpeg/shared_avframe.hpp
 )
 
-if(TARGET nlohmann_json::nlohmann_json)
-    list(APPEND SEEK_TEST_SOURCES "src/common/config.cpp")
-endif()
+set(PHOENIX_NODES_SOURCES
+    src/nodes/source_node.hpp
+    src/nodes/decode_node.hpp
+    src/nodes/video_sink_node.hpp
+)
 
-add_executable(seek_test ${SEEK_TEST_SOURCES})
+set(PHOENIX_RENDER_SOURCES
+    src/render/renderer.hpp
+    src/render/sdl_renderer.hpp
+)
 
-# 创建使用示例可执行文件 (仅在有 JSON 库时)
-if(TARGET nlohmann_json::nlohmann_json)
-    set(EXAMPLE_SOURCES
-        "examples/usage_example.cpp"
-        "src/common/logger.cpp"
-        "src/common/config.cpp"
-        "src/common/error_recovery.cpp"
-    )
-    add_executable(usage_example ${EXAMPLE_SOURCES})
-endif()
+set(PHOENIX_MAIN_SOURCES
+    src/main.cpp
+)
 
-# 设置CUDA属性
-set_property(TARGET streamkit PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-set_property(TARGET seek_test PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-# usage_example 不使用 CUDA，但保留兼容性
+# Combine all sources
+set(PHOENIX_ALL_SOURCES
+    ${PHOENIX_CORE_SOURCES}
+    ${PHOENIX_GRAPH_SOURCES}
+    ${PHOENIX_CODEC_SOURCES}
+    ${PHOENIX_NODES_SOURCES}
+    ${PHOENIX_RENDER_SOURCES}
+    ${PHOENIX_MAIN_SOURCES}
+)
 
-# 链接库 - 使用 vcpkg 提供的 CMake 目标
-target_link_libraries(streamkit
-    # FFmpeg 库
+# ============================================================================
+# Executable
+# ============================================================================
+add_executable(PhoenixEngine ${PHOENIX_ALL_SOURCES})
+
+# Include directories
+target_include_directories(PhoenixEngine PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+# FFmpeg include/link directories
+target_include_directories(PhoenixEngine PRIVATE ${FFMPEG_INCLUDE_DIRS})
+target_link_directories(PhoenixEngine PRIVATE ${FFMPEG_LIBRARY_DIRS})
+
+# Link libraries
+target_link_libraries(PhoenixEngine PRIVATE
     ${FFMPEG_LIBRARIES}
-
-    # spdlog 库
+    $<TARGET_NAME_IF_EXISTS:SDL2::SDL2main>
+    $<IF:$<TARGET_EXISTS:SDL2::SDL2>,SDL2::SDL2,SDL2::SDL2-static>
     spdlog::spdlog
-
-    # fmt 库
     fmt::fmt
-
-    # CUDA库
-    CUDA::cudart
-    CUDA::cuda_driver
 )
 
-# 添加 FFmpeg 包含目录和库目录
-target_include_directories(streamkit PRIVATE ${FFMPEG_INCLUDE_DIRS})
-target_link_directories(streamkit PRIVATE ${FFMPEG_LIBRARY_DIRS})
-
-# 为seek_test链接相同的库
-target_link_libraries(seek_test
-    # FFmpeg 库
-    ${FFMPEG_LIBRARIES}
-
-    # spdlog 库
-    spdlog::spdlog
-
-    # fmt 库
-    fmt::fmt
-
-    # CUDA库
-    CUDA::cudart
-    CUDA::cuda_driver
-)
-
-# 添加 FFmpeg 包含目录和库目录
-target_include_directories(seek_test PRIVATE ${FFMPEG_INCLUDE_DIRS})
-target_link_directories(seek_test PRIVATE ${FFMPEG_LIBRARY_DIRS})
-
-# 为usage_example链接库（需要FFmpeg和CUDA）
-if(TARGET nlohmann_json::nlohmann_json)
-    target_link_libraries(usage_example
-        # FFmpeg 库
-        ${FFMPEG_LIBRARIES}
-
-        # spdlog 库
-        spdlog::spdlog
-
-        # fmt 库
-        fmt::fmt
-
-        # nlohmann_json (header-only)
-        nlohmann_json::nlohmann_json
-
-        # CUDA库
-        CUDA::cudart
-        CUDA::cuda_driver
+# ============================================================================
+# Platform Specific
+# ============================================================================
+if(WIN32)
+    target_compile_definitions(PhoenixEngine PRIVATE
+        PHOENIX_PLATFORM_WINDOWS
+        NOMINMAX                    # Disable min/max macros
+        WIN32_LEAN_AND_MEAN         # Exclude rarely-used Windows headers
+        _CRT_SECURE_NO_WARNINGS     # Disable CRT security warnings
     )
-
-    # 添加 FFmpeg 和 CUDA 包含目录
-    target_include_directories(usage_example PRIVATE ${FFMPEG_INCLUDE_DIRS})
-    target_link_directories(usage_example PRIVATE ${FFMPEG_LIBRARY_DIRS})
-    target_include_directories(usage_example PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    
+    # Link Windows-specific libraries for potential D3D11 hardware decode
+    target_link_libraries(PhoenixEngine PRIVATE
+        d3d11
+        dxgi
+    )
 endif()
 
-# 创建解码器检查工具
-add_executable(check_decoders check_decoders.cpp)
-target_link_libraries(check_decoders
-    ${FFMPEG_LIBRARIES}
-)
-target_include_directories(check_decoders PRIVATE ${FFMPEG_INCLUDE_DIRS})
-target_link_directories(check_decoders PRIVATE ${FFMPEG_LIBRARY_DIRS})
+if(UNIX AND NOT APPLE)
+    target_compile_definitions(PhoenixEngine PRIVATE
+        PHOENIX_PLATFORM_LINUX
+    )
+endif()
 
-# 安装配置
-install(TARGETS streamkit seek_test
+if(APPLE)
+    target_compile_definitions(PhoenixEngine PRIVATE
+        PHOENIX_PLATFORM_MACOS
+    )
+endif()
+
+# ============================================================================
+# Copy DLLs on Windows (Post-build)
+# ============================================================================
+if(WIN32)
+    # Copy FFmpeg DLLs
+    add_custom_command(TARGET PhoenixEngine POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:SDL2::SDL2>
+            $<TARGET_FILE_DIR:PhoenixEngine>
+        COMMAND_EXPAND_LISTS
+    )
+endif()
+
+# ============================================================================
+# Tests (Optional)
+# ============================================================================
+option(PHOENIX_BUILD_TESTS "Build unit tests" OFF)
+
+if(PHOENIX_BUILD_TESTS)
+    enable_testing()
+    find_package(GTest CONFIG QUIET)
+    
+    if(GTest_FOUND)
+        add_executable(PhoenixTests
+            tests/test_object_pool.cpp
+            tests/test_pin.cpp
+            tests/test_clock.cpp
+        )
+        
+        target_include_directories(PhoenixTests PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        
+        target_link_libraries(PhoenixTests PRIVATE
+            GTest::gtest_main
+            spdlog::spdlog
+        )
+        
+        add_test(NAME PhoenixTests COMMAND PhoenixTests)
+    else()
+        message(WARNING "GTest not found, tests will not be built")
+    endif()
+endif()
+
+# ============================================================================
+# Installation (Optional)
+# ============================================================================
+install(TARGETS PhoenixEngine
     RUNTIME DESTINATION bin
-    LIBRARY DESTINATION lib
-    ARCHIVE DESTINATION lib
 )
 
-# 安装头文件
-install(DIRECTORY include/
-    DESTINATION include
-    FILES_MATCHING PATTERN "*.hpp"
-)
+# ============================================================================
+# PhoenixEditor (Qt QML-based GUI)
+# ============================================================================
+if(PHOENIX_BUILD_EDITOR)
+    # Qt 6 Configuration
+    set(CMAKE_AUTOMOC ON)
+    set(CMAKE_AUTORCC ON)
+    set(CMAKE_AUTOUIC ON)
+    
+    # Set Qt path (APPEND, not PREPEND, to not interfere with vcpkg)
+    set(Qt6_DIR "D:/Programs/Qt/6.6.1/msvc2019_64/lib/cmake/Qt6")
+    
+    find_package(Qt6 REQUIRED COMPONENTS 
+        Core
+        Gui
+        Quick
+        Qml
+        QuickControls2
+        QuickDialogs2
+        Multimedia
+    )
+    
+    qt_standard_project_setup()
+    message(STATUS "Qt6 found: ${Qt6_VERSION}")
+    message(STATUS "PhoenixEditor will be built with Qt ${Qt6_VERSION} (QML)")
+    
+    # C++ backend sources
+    set(PHOENIX_EDITOR_SOURCES
+        src/editor/main.cpp
+        src/editor/videocontroller.hpp
+        src/editor/videocontroller.cpp
+    )
+    
+    # QML resources
+    qt_add_executable(PhoenixEditor WIN32
+        ${PHOENIX_EDITOR_SOURCES}
+    )
+    
+    # Add QML module
+    qt_add_qml_module(PhoenixEditor
+        URI PhoenixEditor
+        VERSION 1.0
+        QML_FILES
+            src/editor/qml/Main.qml
+            src/editor/qml/VideoPreview.qml
+            src/editor/qml/Timeline.qml
+            src/editor/qml/TransportControls.qml
+            src/editor/qml/Sidebar.qml
+        RESOURCES
+            src/editor/resources/icons/play.svg
+            src/editor/resources/icons/pause.svg
+            src/editor/resources/icons/stop.svg
+    )
+    
+    target_include_directories(PhoenixEditor PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/editor
+    )
+    
+    target_include_directories(PhoenixEditor PRIVATE ${FFMPEG_INCLUDE_DIRS})
+    target_link_directories(PhoenixEditor PRIVATE ${FFMPEG_LIBRARY_DIRS})
+    
+    target_link_libraries(PhoenixEditor PRIVATE
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Quick
+        Qt6::Qml
+        Qt6::QuickControls2
+        Qt6::QuickDialogs2
+        Qt6::Multimedia
+        ${FFMPEG_LIBRARIES}
+        spdlog::spdlog
+        fmt::fmt
+    )
+    
+    if(WIN32)
+        target_compile_definitions(PhoenixEditor PRIVATE
+            PHOENIX_PLATFORM_WINDOWS
+            NOMINMAX
+            WIN32_LEAN_AND_MEAN
+        )
+    endif()
+    
+endif()
 
+# ============================================================================
+# Summary
+# ============================================================================
+message(STATUS "")
+message(STATUS "PhoenixEngine Configuration Summary:")
+message(STATUS "  Version:        ${PROJECT_VERSION}")
+message(STATUS "  C++ Standard:   ${CMAKE_CXX_STANDARD}")
+message(STATUS "  Build Type:     ${CMAKE_BUILD_TYPE}")
+message(STATUS "  Platform:       ${CMAKE_SYSTEM_NAME}")
+message(STATUS "  Compiler:       ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+if(PHOENIX_BUILD_EDITOR)
+    message(STATUS "  Editor:         ON (Qt ${Qt6_VERSION})")
+else()
+    message(STATUS "  Editor:         OFF")
+endif()
+message(STATUS "")
 

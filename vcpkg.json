@@ -1,18 +1,33 @@
 {
-  "name": "streamkit",
-  "version": "1.0.0",
-  "description": "Video streaming toolkit with hardware acceleration",
-  "builtin-baseline": "984f9232b2fe0eb94f5e9f161d6c632c581fff0c",
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "phoenix-engine",
+  "version": "0.1.0",
+  "description": "Modern C++20 video player with Flow Graph architecture",
+  "homepage": "https://github.com/example/phoenix-engine",
+  "license": "MIT",
+  "supports": "windows & x64",
   "dependencies": [
     {
       "name": "ffmpeg",
       "features": [
-        "nvcodec"
+        "all",
+        "nvcodec",
+        "qsv",
+        "gpl",
+        "x264",
+        "x265",
+        "webp",
+        "avcodec",
+        "avformat",
+        "swscale",
+        "swresample"
       ]
     },
-    "ffnvcodec",
+    "sdl2",
     "spdlog",
-    "fmt",
-    "nlohmann-json"
-  ]
-}    
+    "fmt"
+  ],
+  "overrides": [],
+  "builtin-baseline": "984f9232b2fe0eb94f5e9f161d6c632c581fff0c"
+}
+
