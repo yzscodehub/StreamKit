@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(PhoenixEngine VERSION 0.1.0 LANGUAGES CXX)
+project(Phoenix VERSION 0.4.0 LANGUAGES CXX)
 
 # ============================================================================
 # C++20 Configuration
@@ -12,8 +12,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # ============================================================================
-# Qt 6 Configuration (Optional Editor) - Define option only, defer setup
+# Build Options
 # ============================================================================
+option(PHOENIX_BUILD_TESTS "Build unit tests" OFF)
 option(PHOENIX_BUILD_EDITOR "Build Qt-based Editor" OFF)
 
 # ============================================================================
@@ -27,7 +28,6 @@ if(MSVC)
         /utf-8              # UTF-8 source and execution charset
         /MP                 # Multi-processor compilation
     )
-    # Disable specific warnings that are too noisy
     add_compile_options(/wd4100)  # unreferenced formal parameter
 else()
     add_compile_options(
@@ -39,281 +39,61 @@ else()
 endif()
 
 # ============================================================================
-# FFmpeg Version Check
-# ============================================================================
-# We require FFmpeg 5.x+ for the new send/receive API
-# libavcodec 59+ = FFmpeg 5.0+
-# libavcodec 60+ = FFmpeg 6.0+
-# libavcodec 61+ = FFmpeg 7.0+
-
-# ============================================================================
 # Dependencies
 # ============================================================================
-
-# FFmpeg via vcpkg's CMake integration
-find_package(FFMPEG REQUIRED)
-
-# SDL2
-find_package(SDL2 CONFIG REQUIRED)
 
 # spdlog for logging
 find_package(spdlog CONFIG REQUIRED)
 
-# fmt (usually comes with spdlog, but explicit is better)
+# fmt
 find_package(fmt CONFIG REQUIRED)
 
-# ============================================================================
-# Source Files
-# ============================================================================
-set(PHOENIX_CORE_SOURCES
-    src/core/types.hpp
-    src/core/result.hpp
-    src/core/media_frame.hpp
-    src/core/object_pool.hpp
-    src/core/clock.hpp
-)
-
-set(PHOENIX_GRAPH_SOURCES
-    src/graph/concepts.hpp
-    src/graph/pin.hpp
-    src/graph/node.hpp
-    src/graph/async_queue.hpp
-    src/graph/pipeline.hpp
-)
-
-set(PHOENIX_CODEC_SOURCES
-    src/codec/ffmpeg/ff_utils.hpp
-    src/codec/ffmpeg/shared_avframe.hpp
-)
-
-set(PHOENIX_NODES_SOURCES
-    src/nodes/source_node.hpp
-    src/nodes/decode_node.hpp
-    src/nodes/video_sink_node.hpp
-)
-
-set(PHOENIX_RENDER_SOURCES
-    src/render/renderer.hpp
-    src/render/sdl_renderer.hpp
-)
-
-set(PHOENIX_MAIN_SOURCES
-    src/main.cpp
-)
-
-# Combine all sources
-set(PHOENIX_ALL_SOURCES
-    ${PHOENIX_CORE_SOURCES}
-    ${PHOENIX_GRAPH_SOURCES}
-    ${PHOENIX_CODEC_SOURCES}
-    ${PHOENIX_NODES_SOURCES}
-    ${PHOENIX_RENDER_SOURCES}
-    ${PHOENIX_MAIN_SOURCES}
-)
+# nlohmann-json for project file serialization
+find_package(nlohmann_json CONFIG REQUIRED)
 
 # ============================================================================
-# Executable
+# Phoenix Core Library
 # ============================================================================
-add_executable(PhoenixEngine ${PHOENIX_ALL_SOURCES})
-
-# Include directories
-target_include_directories(PhoenixEngine PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
-
-# FFmpeg include/link directories
-target_include_directories(PhoenixEngine PRIVATE ${FFMPEG_INCLUDE_DIRS})
-target_link_directories(PhoenixEngine PRIVATE ${FFMPEG_LIBRARY_DIRS})
-
-# Link libraries
-target_link_libraries(PhoenixEngine PRIVATE
-    ${FFMPEG_LIBRARIES}
-    $<TARGET_NAME_IF_EXISTS:SDL2::SDL2main>
-    $<IF:$<TARGET_EXISTS:SDL2::SDL2>,SDL2::SDL2,SDL2::SDL2-static>
-    spdlog::spdlog
-    fmt::fmt
-)
+add_subdirectory(phoenix/core)
 
 # ============================================================================
-# Platform Specific
+# Phoenix Model Library
 # ============================================================================
-if(WIN32)
-    target_compile_definitions(PhoenixEngine PRIVATE
-        PHOENIX_PLATFORM_WINDOWS
-        NOMINMAX                    # Disable min/max macros
-        WIN32_LEAN_AND_MEAN         # Exclude rarely-used Windows headers
-        _CRT_SECURE_NO_WARNINGS     # Disable CRT security warnings
-    )
-    
-    # Link Windows-specific libraries for potential D3D11 hardware decode
-    target_link_libraries(PhoenixEngine PRIVATE
-        d3d11
-        dxgi
-    )
-endif()
-
-if(UNIX AND NOT APPLE)
-    target_compile_definitions(PhoenixEngine PRIVATE
-        PHOENIX_PLATFORM_LINUX
-    )
-endif()
-
-if(APPLE)
-    target_compile_definitions(PhoenixEngine PRIVATE
-        PHOENIX_PLATFORM_MACOS
-    )
-endif()
+add_subdirectory(phoenix/model)
 
 # ============================================================================
-# Copy DLLs on Windows (Post-build)
+# Phoenix Media Library (FFmpeg wrapper)
 # ============================================================================
-if(WIN32)
-    # Copy FFmpeg DLLs
-    add_custom_command(TARGET PhoenixEngine POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE:SDL2::SDL2>
-            $<TARGET_FILE_DIR:PhoenixEngine>
-        COMMAND_EXPAND_LISTS
-    )
-endif()
+add_subdirectory(phoenix/media)
 
 # ============================================================================
-# Tests (Optional)
+# Phoenix Engine Library (Playback/Compositor)
 # ============================================================================
-option(PHOENIX_BUILD_TESTS "Build unit tests" OFF)
-
-if(PHOENIX_BUILD_TESTS)
-    enable_testing()
-    find_package(GTest CONFIG QUIET)
-    
-    if(GTest_FOUND)
-        add_executable(PhoenixTests
-            tests/test_object_pool.cpp
-            tests/test_pin.cpp
-            tests/test_clock.cpp
-        )
-        
-        target_include_directories(PhoenixTests PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src
-        )
-        
-        target_link_libraries(PhoenixTests PRIVATE
-            GTest::gtest_main
-            spdlog::spdlog
-        )
-        
-        add_test(NAME PhoenixTests COMMAND PhoenixTests)
-    else()
-        message(WARNING "GTest not found, tests will not be built")
-    endif()
-endif()
+add_subdirectory(phoenix/engine)
 
 # ============================================================================
-# Installation (Optional)
-# ============================================================================
-install(TARGETS PhoenixEngine
-    RUNTIME DESTINATION bin
-)
-
-# ============================================================================
-# PhoenixEditor (Qt QML-based GUI)
+# Editor Target (Qt/QML) - Phase 4 目标
 # ============================================================================
 if(PHOENIX_BUILD_EDITOR)
-    # Qt 6 Configuration
-    set(CMAKE_AUTOMOC ON)
-    set(CMAKE_AUTORCC ON)
-    set(CMAKE_AUTOUIC ON)
-    
-    # Set Qt path (APPEND, not PREPEND, to not interfere with vcpkg)
-    set(Qt6_DIR "D:/Programs/Qt/6.6.1/msvc2019_64/lib/cmake/Qt6")
-    
-    find_package(Qt6 REQUIRED COMPONENTS 
-        Core
-        Gui
-        Quick
-        Qml
-        QuickControls2
-        QuickDialogs2
-        Multimedia
-    )
-    
-    qt_standard_project_setup()
-    message(STATUS "Qt6 found: ${Qt6_VERSION}")
-    message(STATUS "PhoenixEditor will be built with Qt ${Qt6_VERSION} (QML)")
-    
-    # C++ backend sources
-    set(PHOENIX_EDITOR_SOURCES
-        src/editor/main.cpp
-        src/editor/videocontroller.hpp
-        src/editor/videocontroller.cpp
-    )
-    
-    # QML resources
-    qt_add_executable(PhoenixEditor WIN32
-        ${PHOENIX_EDITOR_SOURCES}
-    )
-    
-    # Add QML module
-    qt_add_qml_module(PhoenixEditor
-        URI PhoenixEditor
-        VERSION 1.0
-        QML_FILES
-            src/editor/qml/Main.qml
-            src/editor/qml/VideoPreview.qml
-            src/editor/qml/Timeline.qml
-            src/editor/qml/TransportControls.qml
-            src/editor/qml/Sidebar.qml
-        RESOURCES
-            src/editor/resources/icons/play.svg
-            src/editor/resources/icons/pause.svg
-            src/editor/resources/icons/stop.svg
-    )
-    
-    target_include_directories(PhoenixEditor PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/editor
-    )
-    
-    target_include_directories(PhoenixEditor PRIVATE ${FFMPEG_INCLUDE_DIRS})
-    target_link_directories(PhoenixEditor PRIVATE ${FFMPEG_LIBRARY_DIRS})
-    
-    target_link_libraries(PhoenixEditor PRIVATE
-        Qt6::Core
-        Qt6::Gui
-        Qt6::Quick
-        Qt6::Qml
-        Qt6::QuickControls2
-        Qt6::QuickDialogs2
-        Qt6::Multimedia
-        ${FFMPEG_LIBRARIES}
-        spdlog::spdlog
-        fmt::fmt
-    )
-    
-    if(WIN32)
-        target_compile_definitions(PhoenixEditor PRIVATE
-            PHOENIX_PLATFORM_WINDOWS
-            NOMINMAX
-            WIN32_LEAN_AND_MEAN
-        )
-    endif()
-    
+    add_subdirectory(apps/editor)
+endif()
+
+# ============================================================================
+# Tests
+# ============================================================================
+if(PHOENIX_BUILD_TESTS)
+    enable_testing()
+    # TODO: 添加测试
 endif()
 
 # ============================================================================
 # Summary
 # ============================================================================
 message(STATUS "")
-message(STATUS "PhoenixEngine Configuration Summary:")
-message(STATUS "  Version:        ${PROJECT_VERSION}")
-message(STATUS "  C++ Standard:   ${CMAKE_CXX_STANDARD}")
-message(STATUS "  Build Type:     ${CMAKE_BUILD_TYPE}")
-message(STATUS "  Platform:       ${CMAKE_SYSTEM_NAME}")
-message(STATUS "  Compiler:       ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
-if(PHOENIX_BUILD_EDITOR)
-    message(STATUS "  Editor:         ON (Qt ${Qt6_VERSION})")
-else()
-    message(STATUS "  Editor:         OFF")
-endif()
+message(STATUS "Phoenix Configuration:")
+message(STATUS "  Version:    ${PROJECT_VERSION}")
+message(STATUS "  C++:        ${CMAKE_CXX_STANDARD}")
+message(STATUS "  Platform:   ${CMAKE_SYSTEM_NAME}")
+message(STATUS "  Editor:     ${PHOENIX_BUILD_EDITOR}")
+message(STATUS "  Tests:      ${PHOENIX_BUILD_TESTS}")
 message(STATUS "")
-

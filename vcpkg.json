@@ -1,9 +1,9 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
-  "name": "phoenix-engine",
-  "version": "0.1.0",
-  "description": "Modern C++20 video player with Flow Graph architecture",
-  "homepage": "https://github.com/example/phoenix-engine",
+  "name": "phoenix-editor",
+  "version": "0.2.0",
+  "description": "Modern C++20 non-linear video editor (NLE)",
+  "homepage": "https://github.com/example/phoenix-editor",
   "license": "MIT",
   "supports": "windows & x64",
   "dependencies": [
@@ -25,7 +25,9 @@
     },
     "sdl2",
     "spdlog",
-    "fmt"
+    "fmt",
+    "nlohmann-json",
+    "stb"
   ],
   "overrides": [],
   "builtin-baseline": "984f9232b2fe0eb94f5e9f161d6c632c581fff0c"
